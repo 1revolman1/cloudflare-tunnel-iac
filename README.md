@@ -36,6 +36,7 @@ cft 3000 app
 - `terraform` (`brew install hashicorp/tap/terraform` — HashiCorp pulled it from
   homebrew-core, use their own tap)
 - `jq`, `cloudflared` (`brew install jq cloudflared`)
+- `mitmproxy` (`brew install mitmproxy`) — only needed for `--inspect`
 - `cloudflared tunnel login` already run once (creates `~/.cloudflared/cert.pem`)
 - An existing Cloudflare Tunnel (`cloudflared tunnel create <name>`) — this project
   manages DNS + ingress for it, not the tunnel resource itself
@@ -74,12 +75,38 @@ source ~/.zshrc
 ## Usage
 
 ```bash
-cft <port> [subdomain]   # expose localhost:<port>, default subdomain "dev"
-cft-list                 # show current routes
-cft-rm <subdomain>       # remove a route
-cft-stop                 # stop the background cloudflared daemon
-cft-help                 # show all commands
+cft <port> [subdomain]            # expose localhost:<port>, default subdomain "dev"
+cft <port> [subdomain] --inspect  # same, but with a request inspector (see below)
+cft-list                          # show current routes
+cft-rm <subdomain>                # remove a route
+cft-stop                          # stop the background cloudflared daemon (+ inspectors)
+cft-help                          # show all commands
 ```
+
+### Request inspector (`--inspect`)
+
+`cft 3000 app --inspect` puts [mitmweb](https://mitmproxy.org/) (`brew install mitmproxy`)
+in between cloudflared and your app — a local reverse proxy that logs every request and
+response, body included, in a browser UI. This is the ngrok-inspector equivalent:
+
+```text
+cft 3000 app --inspect
+# https://app.<your-domain> -> localhost:3000
+# inspector: http://localhost:13500 (password: <random, printed each time it (re)starts>)
+```
+
+Open the inspector URL, enter the printed password once (it's remembered via a cookie
+after that). Traffic flow: `Cloudflare edge → cloudflared → mitmweb → localhost:3000`, all
+plain HTTP locally (no certs needed — Cloudflare already terminated TLS at the edge).
+
+- `mitmweb`'s listen port is `<port> + 10000`, its web UI is `<port> + 10500` — pick dev
+  ports below ~10000 to avoid collisions with other local services.
+- Re-running `cft 3000 app` (without `--inspect`) switches that route back to hitting
+  your app directly and stops the inspector for it.
+- `cft-list` shows `[inspecting @ http://localhost:...]` next to any route currently in
+  inspect mode; `cft-rm`/`cft-stop` clean up inspector processes too.
+- State lives in `mitm.json` (gitignored — holds per-inspector passwords) and
+  `mitm-<subdomain>.log` (mitmweb's own log, also gitignored).
 
 ## Files
 

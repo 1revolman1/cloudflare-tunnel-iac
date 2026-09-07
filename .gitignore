@@ -4,3 +4,5 @@
 terraform.tfvars
 .cloudflared.pid
 cloudflared.log
+mitm.json
+mitm-*.log
