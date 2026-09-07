@@ -37,6 +37,14 @@ _cft_apply() {
   (cd "$CFT_DIR" && terraform apply -auto-approve -input=false)
 }
 
+# Apply a jq filter to a JSON file in place: read -> filter -> atomic replace.
+# Extra args (e.g. --arg/--argjson) are passed straight through to jq.
+_cft_json_update() {
+  local file="$1" filter="$2"
+  shift 2
+  jq "$@" "$filter" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+}
+
 # --- request inspector / basic auth (mitmproxy reverse proxy) -----------
 #
 # routes.json always holds the port cloudflared's ingress forwards to. When
@@ -47,28 +55,51 @@ _cft_apply() {
 # request/response bodies (--inspect, via mitmweb) and/or enforcing HTTP
 # Basic Auth before forwarding (--auth, via mitm_basic_auth.py). mitm.json
 # tracks, per subdomain, the real port + this process's ports/pid/params so
-# cft-list/cft-rm/cft can find and tear it down again.
-_cft_mitm_file() { echo "$CFT_DIR/mitm.json"; }
-
+# cft-list/cft-rm/cft can find and tear it down again. Entries written before
+# --auth existed have no .inspect/.auth keys -- _cft_mitm_entry normalizes
+# those to 0/"" so every reader sees old entries as "no proxy" consistently.
 _cft_mitm_init() {
-  [ -f "$(_cft_mitm_file)" ] || echo '{}' > "$(_cft_mitm_file)"
+  [ -f "$CFT_DIR/mitm.json" ] || echo '{}' > "$CFT_DIR/mitm.json"
 }
 
+# Returns the entry with .pid/.inspect/.auth/.web_port/.password normalized
+# to ""/0/""/0/"" when absent, so no caller needs its own fallback for
+# entries written before --auth existed (or a hypothetical corrupt entry).
 _cft_mitm_entry() {
   local sub="$1"
   _cft_mitm_init
-  jq -r --arg s "$sub" '.[$s] // empty' "$(_cft_mitm_file)"
+  jq -r --arg s "$sub" \
+    '.[$s] // empty | (.pid //= "" | .inspect //= 0 | .auth //= "" | .web_port //= 0 | .password //= "")' \
+    "$CFT_DIR/mitm.json"
 }
 
+# The one place that knows how to kill a tracked proxy's process, given a
+# pid a caller already has on hand (avoids re-reading mitm.json just to
+# look the pid up again).
+_cft_kill_pid() {
+  local pid="$1"
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null
+}
+
+# Kills and removes one mitm.json entry. Pass a known pid (e.g. one a
+# caller already extracted via _cft_mitm_entry) to skip re-reading the file.
 _cft_stop_mitm() {
-  local sub="$1"
-  local entry pid
-  entry=$(_cft_mitm_entry "$sub")
-  [ -z "$entry" ] && return 0
-  pid=$(echo "$entry" | jq -r '.pid')
-  kill "$pid" 2>/dev/null
-  jq --arg s "$sub" 'del(.[$s])' "$(_cft_mitm_file)" > "$(_cft_mitm_file).tmp" \
-    && mv "$(_cft_mitm_file).tmp" "$(_cft_mitm_file)"
+  local sub="$1" pid="${2:-}"
+  if [ -z "$pid" ]; then
+    local entry
+    entry=$(_cft_mitm_entry "$sub")
+    [ -z "$entry" ] && return 0
+    pid=$(jq -r '.pid' <<<"$entry")
+  fi
+  _cft_kill_pid "$pid"
+  _cft_json_update "$CFT_DIR/mitm.json" 'del(.[$s])' --arg s "$sub"
+}
+
+# Builds the bare inspector URL/password string (the caller adds the
+# "inspector: " label), empty when not inspecting.
+_cft_web_url() {
+  local inspect="$1" web_port="$2" password="$3"
+  [ "$inspect" = "1" ] && echo "http://localhost:${web_port} (password: ${password})"
 }
 
 # Sets _CFT_MITM_ROUTE_PORT (the port to put in routes.json) and
@@ -92,27 +123,25 @@ _cft_start_proxy() {
   if [ -n "$auth" ]; then
     authuser="${auth%%:*}"
     authpass="${auth#*:}"
-    if [ "$authuser" = "$auth" ] || [ -z "$authpass" ]; then
+    if [ "$authuser" = "$auth" ] || [ -z "$authuser" ] || [ -z "$authpass" ]; then
       echo "usage: --auth user:pass" >&2
       return 1
     fi
   fi
 
-  local entry existing_pid existing_port existing_inspect existing_auth
+  local entry
   entry=$(_cft_mitm_entry "$sub")
   if [ -n "$entry" ]; then
-    existing_pid=$(echo "$entry" | jq -r '.pid')
-    existing_port=$(echo "$entry" | jq -r '.port')
-    existing_inspect=$(echo "$entry" | jq -r '.inspect')
-    existing_auth=$(echo "$entry" | jq -r '.auth')
+    local existing_pid existing_port existing_inspect existing_auth existing_proxy_port existing_web_port existing_password
+    IFS=$'\t' read -r existing_pid existing_port existing_inspect existing_auth existing_proxy_port existing_web_port existing_password \
+      < <(jq -r '[.pid, .port, .inspect, .auth, .proxy_port, .web_port, .password] | @tsv' <<<"$entry")
     if [ "$existing_port" = "$port" ] && [ "$existing_inspect" = "$inspect" ] \
        && [ "$existing_auth" = "$auth" ] && kill -0 "$existing_pid" 2>/dev/null; then
-      _CFT_MITM_ROUTE_PORT=$(echo "$entry" | jq -r '.proxy_port')
-      _CFT_MITM_WEB_URL=""
-      [ "$inspect" -eq 1 ] && _CFT_MITM_WEB_URL="http://localhost:$(echo "$entry" | jq -r '.web_port') (password: $(echo "$entry" | jq -r '.password'))"
+      _CFT_MITM_ROUTE_PORT=$existing_proxy_port
+      _CFT_MITM_WEB_URL=$(_cft_web_url "$inspect" "$existing_web_port" "$existing_password")
       return 0
     fi
-    _cft_stop_mitm "$sub"
+    _cft_stop_mitm "$sub" "$existing_pid"
   fi
 
   local proxy_port=$((port + 10000))
@@ -136,15 +165,14 @@ _cft_start_proxy() {
     return 1
   fi
 
-  jq --arg s "$sub" --argjson port "$port" --argjson proxy_port "$proxy_port" \
-     --argjson web_port "$web_port" --arg password "$password" --argjson pid "$pid" \
-     --argjson inspect "$inspect" --arg auth "$auth" \
-     '.[$s] = {port: $port, proxy_port: $proxy_port, web_port: $web_port, password: $password, pid: $pid, inspect: $inspect, auth: $auth}' \
-     "$(_cft_mitm_file)" > "$(_cft_mitm_file).tmp" && mv "$(_cft_mitm_file).tmp" "$(_cft_mitm_file)"
+  _cft_json_update "$CFT_DIR/mitm.json" \
+    '.[$s] = {port: $port, proxy_port: $proxy_port, web_port: $web_port, password: $password, pid: $pid, inspect: $inspect, auth: $auth}' \
+    --arg s "$sub" --argjson port "$port" --argjson proxy_port "$proxy_port" \
+    --argjson web_port "$web_port" --arg password "$password" --argjson pid "$pid" \
+    --argjson inspect "$inspect" --arg auth "$auth"
 
   _CFT_MITM_ROUTE_PORT=$proxy_port
-  _CFT_MITM_WEB_URL=""
-  [ "$inspect" -eq 1 ] && _CFT_MITM_WEB_URL="http://localhost:${web_port} (password: ${password})"
+  _CFT_MITM_WEB_URL=$(_cft_web_url "$inspect" "$web_port" "$password")
 }
 
 _cft_ensure_daemon() {
@@ -222,9 +250,8 @@ cft() {
   _cft_start_proxy "$sub" "$port" "$inspect" "$auth" || return 1
   local route_port=$_CFT_MITM_ROUTE_PORT
 
-  jq --arg sub "$sub" --argjson port "$route_port" '.routes[$sub] = $port' \
-    "$CFT_DIR/routes.json" > "$CFT_DIR/routes.json.tmp" \
-    && mv "$CFT_DIR/routes.json.tmp" "$CFT_DIR/routes.json"
+  _cft_json_update "$CFT_DIR/routes.json" '.routes[$sub] = $port' \
+    --arg sub "$sub" --argjson port "$route_port"
 
   _cft_apply || return 1
   _cft_ensure_daemon || return 1
@@ -238,26 +265,20 @@ cft() {
 
 cft-list() {
   _cft_check_deps || return 1
-  _cft_mitm_init
   local sub route_port entry real_port web_port inspect auth tags
-  jq -r '.routes | keys[]' "$CFT_DIR/routes.json" | while IFS= read -r sub; do
-    route_port=$(jq -r --arg s "$sub" '.routes[$s]' "$CFT_DIR/routes.json")
+  while IFS=$'\t' read -r sub route_port; do
     entry=$(_cft_mitm_entry "$sub")
     if [ -n "$entry" ]; then
-      real_port=$(echo "$entry" | jq -r '.port')
-      inspect=$(echo "$entry" | jq -r '.inspect')
-      auth=$(echo "$entry" | jq -r '.auth')
+      IFS=$'\t' read -r real_port web_port inspect auth \
+        < <(jq -r '[.port, .web_port, .inspect, .auth] | @tsv' <<<"$entry")
       tags=""
-      if [ "$inspect" = "1" ]; then
-        web_port=$(echo "$entry" | jq -r '.web_port')
-        tags="$tags [inspecting @ http://localhost:$web_port]"
-      fi
+      [ "$inspect" = "1" ] && tags="$tags [inspecting @ http://localhost:$web_port]"
       [ -n "$auth" ] && tags="$tags [auth: ${auth%%:*}]"
       echo "$sub -> localhost:$real_port $tags"
     else
       echo "$sub -> localhost:$route_port"
     fi
-  done
+  done < <(jq -r '.routes | to_entries[] | [.key, .value] | @tsv' "$CFT_DIR/routes.json")
 }
 
 cft-rm() {
@@ -269,11 +290,7 @@ cft-rm() {
   fi
 
   _cft_stop_mitm "$sub"
-
-  jq --arg sub "$sub" 'del(.routes[$sub])' \
-    "$CFT_DIR/routes.json" > "$CFT_DIR/routes.json.tmp" \
-    && mv "$CFT_DIR/routes.json.tmp" "$CFT_DIR/routes.json"
-
+  _cft_json_update "$CFT_DIR/routes.json" 'del(.routes[$sub])' --arg sub "$sub"
   _cft_apply
 }
 
@@ -287,12 +304,15 @@ cft-stop() {
     echo "no running daemon tracked"
   fi
 
+  # Stops everything tracked, so just kill every pid and clear the file in
+  # one pass instead of a read-modify-write per entry.
   _cft_mitm_init
-  local sub
-  jq -r 'keys[]' "$(_cft_mitm_file)" | while IFS= read -r sub; do
-    _cft_stop_mitm "$sub"
-    echo "inspector for '$sub' stopped"
-  done
+  local sub pid
+  while IFS=$'\t' read -r sub pid; do
+    _cft_kill_pid "$pid"
+    echo "proxy for '$sub' stopped"
+  done < <(jq -r 'to_entries[] | [.key, (.value.pid // "")] | @tsv' "$CFT_DIR/mitm.json")
+  echo '{}' > "$CFT_DIR/mitm.json"
 }
 
 echo "cft tunnel helpers loaded (cft, cft-list, cft-rm, cft-stop) — run 'cft-help' for details"
