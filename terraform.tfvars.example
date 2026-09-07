@@ -1,0 +1,4 @@
+account_id = "your-cloudflare-account-id"
+zone_id    = "your-zone-id"
+tunnel_id  = "your-tunnel-uuid"
+domain     = "example.com"
