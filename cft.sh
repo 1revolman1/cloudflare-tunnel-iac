@@ -37,15 +37,17 @@ _cft_apply() {
   (cd "$CFT_DIR" && terraform apply -auto-approve -input=false)
 }
 
-# --- request inspector (mitmweb reverse proxy) --------------------------
+# --- request inspector / basic auth (mitmproxy reverse proxy) -----------
 #
-# routes.json always holds the port cloudflared's ingress forwards to. In
-# --inspect mode that's mitmweb's listen port, not the app's real port --
-# mitmweb sits in between (plain http -> http, no TLS/certs involved since
-# Cloudflare already terminated HTTPS at the edge) and exposes a browser UI
-# with full request/response bodies. mitm.json tracks, per subdomain, the
-# real port + mitm's ports/pid/password so cft-list/cft-rm/cft can find and
-# tear it down again.
+# routes.json always holds the port cloudflared's ingress forwards to. When
+# --inspect and/or --auth is used, that's this local mitmproxy instance's
+# listen port, not the app's real port -- it sits in between (plain
+# http -> http, no TLS/certs involved since Cloudflare already terminated
+# HTTPS at the edge), optionally showing a browser UI with full
+# request/response bodies (--inspect, via mitmweb) and/or enforcing HTTP
+# Basic Auth before forwarding (--auth, via mitm_basic_auth.py). mitm.json
+# tracks, per subdomain, the real port + this process's ports/pid/params so
+# cft-list/cft-rm/cft can find and tear it down again.
 _cft_mitm_file() { echo "$CFT_DIR/mitm.json"; }
 
 _cft_mitm_init() {
@@ -70,50 +72,79 @@ _cft_stop_mitm() {
 }
 
 # Sets _CFT_MITM_ROUTE_PORT (the port to put in routes.json) and
-# _CFT_MITM_WEB_URL (printed to the user) on success.
-_cft_start_mitm() {
-  local sub="$1" port="$2"
-  command -v mitmweb >/dev/null 2>&1 || { echo "missing dependency: mitmweb (brew install mitmproxy)" >&2; return 1; }
+# _CFT_MITM_WEB_URL (printed to the user, empty if not --inspect) on
+# success. inspect is 0/1, auth is "" or "user:pass".
+_cft_start_proxy() {
+  local sub="$1" port="$2" inspect="$3" auth="$4"
 
-  local entry existing_pid existing_port
+  if [ "$inspect" -ne 1 ] && [ -z "$auth" ]; then
+    _cft_stop_mitm "$sub"
+    _CFT_MITM_ROUTE_PORT=$port
+    _CFT_MITM_WEB_URL=""
+    return 0
+  fi
+
+  local bin=mitmdump
+  [ "$inspect" -eq 1 ] && bin=mitmweb
+  command -v "$bin" >/dev/null 2>&1 || { echo "missing dependency: $bin (brew install mitmproxy)" >&2; return 1; }
+
+  local authuser="" authpass=""
+  if [ -n "$auth" ]; then
+    authuser="${auth%%:*}"
+    authpass="${auth#*:}"
+    if [ "$authuser" = "$auth" ] || [ -z "$authpass" ]; then
+      echo "usage: --auth user:pass" >&2
+      return 1
+    fi
+  fi
+
+  local entry existing_pid existing_port existing_inspect existing_auth
   entry=$(_cft_mitm_entry "$sub")
   if [ -n "$entry" ]; then
     existing_pid=$(echo "$entry" | jq -r '.pid')
     existing_port=$(echo "$entry" | jq -r '.port')
-    if [ "$existing_port" = "$port" ] && kill -0 "$existing_pid" 2>/dev/null; then
+    existing_inspect=$(echo "$entry" | jq -r '.inspect')
+    existing_auth=$(echo "$entry" | jq -r '.auth')
+    if [ "$existing_port" = "$port" ] && [ "$existing_inspect" = "$inspect" ] \
+       && [ "$existing_auth" = "$auth" ] && kill -0 "$existing_pid" 2>/dev/null; then
       _CFT_MITM_ROUTE_PORT=$(echo "$entry" | jq -r '.proxy_port')
-      _CFT_MITM_WEB_URL="http://localhost:$(echo "$entry" | jq -r '.web_port') (password: $(echo "$entry" | jq -r '.password'))"
+      _CFT_MITM_WEB_URL=""
+      [ "$inspect" -eq 1 ] && _CFT_MITM_WEB_URL="http://localhost:$(echo "$entry" | jq -r '.web_port') (password: $(echo "$entry" | jq -r '.password'))"
       return 0
     fi
     _cft_stop_mitm "$sub"
   fi
 
   local proxy_port=$((port + 10000))
-  local web_port=$((port + 10500))
-  local password
-  password=$(openssl rand -hex 8 2>/dev/null || echo "cft-$RANDOM")
+  local web_port=0
+  local password=""
+  local -a cmd=("$bin" --mode "reverse:http://localhost:${port}" --listen-port "$proxy_port")
 
-  nohup mitmweb \
-    --mode "reverse:http://localhost:${port}" \
-    --listen-port "$proxy_port" \
-    --web-port "$web_port" \
-    --set web_open_browser=false \
-    --set "web_password=${password}" \
-    > "$CFT_DIR/mitm-${sub}.log" 2>&1 &
+  if [ "$inspect" -eq 1 ]; then
+    web_port=$((port + 10500))
+    password=$(openssl rand -hex 8 2>/dev/null || echo "cft-$RANDOM")
+    cmd+=(--web-port "$web_port" --set web_open_browser=false --set "web_password=${password}")
+  fi
+  [ -n "$auth" ] && cmd+=(-s "$CFT_DIR/mitm_basic_auth.py")
+
+  CFT_BASIC_AUTH_USER="$authuser" CFT_BASIC_AUTH_PASS="$authpass" \
+    nohup "${cmd[@]}" > "$CFT_DIR/mitm-${sub}.log" 2>&1 &
   local pid=$!
   sleep 2
   if ! kill -0 "$pid" 2>/dev/null; then
-    echo "mitmweb failed to start, see $CFT_DIR/mitm-${sub}.log" >&2
+    echo "$bin failed to start, see $CFT_DIR/mitm-${sub}.log" >&2
     return 1
   fi
 
   jq --arg s "$sub" --argjson port "$port" --argjson proxy_port "$proxy_port" \
      --argjson web_port "$web_port" --arg password "$password" --argjson pid "$pid" \
-     '.[$s] = {port: $port, proxy_port: $proxy_port, web_port: $web_port, password: $password, pid: $pid}' \
+     --argjson inspect "$inspect" --arg auth "$auth" \
+     '.[$s] = {port: $port, proxy_port: $proxy_port, web_port: $web_port, password: $password, pid: $pid, inspect: $inspect, auth: $auth}' \
      "$(_cft_mitm_file)" > "$(_cft_mitm_file).tmp" && mv "$(_cft_mitm_file).tmp" "$(_cft_mitm_file)"
 
   _CFT_MITM_ROUTE_PORT=$proxy_port
-  _CFT_MITM_WEB_URL="http://localhost:${web_port} (password: ${password})"
+  _CFT_MITM_WEB_URL=""
+  [ "$inspect" -eq 1 ] && _CFT_MITM_WEB_URL="http://localhost:${web_port} (password: ${password})"
 }
 
 _cft_ensure_daemon() {
@@ -143,18 +174,21 @@ _cft_ensure_daemon() {
 
 cft-help() {
   cat <<'EOF'
-cft <port> [subdomain] [--inspect]
+cft <port> [subdomain] [--inspect] [--auth user:pass]
                          Expose localhost:<port> at https://<subdomain>.<domain>
                          (default subdomain: dev). Writes routes.json, runs
                          terraform apply, starts the cloudflared daemon if needed.
-                         With --inspect, puts a local mitmweb reverse proxy in
+                         --inspect puts a local mitmweb reverse proxy in
                          between so you can see every request/response (incl.
                          body) in a browser UI -- like ngrok's inspector.
+                         --auth user:pass requires that HTTP Basic Auth on
+                         every request before it reaches your app -- combine
+                         both to inspect AND password-protect at once.
 cft-list                 Show all currently configured subdomain -> port routes
-                         (and the inspector URL for any that are --inspect'd).
-cft-rm <subdomain>       Remove a route (and its inspector, if any) and apply.
+                         (with tags for any that are --inspect'd / --auth'd).
+cft-rm <subdomain>       Remove a route (and its proxy, if any) and apply.
 cft-stop                 Kill the background cloudflared daemon and any
-                         running inspectors.
+                         running inspect/auth proxies.
 cft-help                 Show this message.
 EOF
 }
@@ -163,18 +197,20 @@ cft() {
   _cft_check_deps || return 1
   local port="$1"
   if [ -z "$port" ]; then
-    echo "usage: cft <port> [subdomain] [--inspect]   -- expose localhost:<port> at https://<subdomain>.<domain> (run 'cft-help' for all commands)" >&2
+    echo "usage: cft <port> [subdomain] [--inspect] [--auth user:pass]   -- (run 'cft-help' for details)" >&2
     return 1
   fi
   shift
 
   local sub="dev"
   local inspect=0
-  local arg
-  for arg in "$@"; do
-    case "$arg" in
-      --inspect) inspect=1 ;;
-      *) sub="$arg" ;;
+  local auth=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --inspect) inspect=1; shift ;;
+      --auth) auth="$2"; shift 2 ;;
+      --auth=*) auth="${1#--auth=}"; shift ;;
+      *) sub="$1"; shift ;;
     esac
   done
 
@@ -183,14 +219,8 @@ cft() {
     return 1
   fi
 
-  local route_port
-  if [ "$inspect" -eq 1 ]; then
-    _cft_start_mitm "$sub" "$port" || return 1
-    route_port=$_CFT_MITM_ROUTE_PORT
-  else
-    _cft_stop_mitm "$sub"
-    route_port=$port
-  fi
+  _cft_start_proxy "$sub" "$port" "$inspect" "$auth" || return 1
+  local route_port=$_CFT_MITM_ROUTE_PORT
 
   jq --arg sub "$sub" --argjson port "$route_port" '.routes[$sub] = $port' \
     "$CFT_DIR/routes.json" > "$CFT_DIR/routes.json.tmp" \
@@ -202,20 +232,28 @@ cft() {
   local domain
   domain=$(cd "$CFT_DIR" && terraform output -raw domain 2>/dev/null)
   echo "https://${sub}.${domain} -> localhost:${port}"
-  [ "$inspect" -eq 1 ] && echo "inspector: $_CFT_MITM_WEB_URL"
+  [ -n "$_CFT_MITM_WEB_URL" ] && echo "inspector: $_CFT_MITM_WEB_URL"
+  [ -n "$auth" ] && echo "basic auth enabled (user: ${auth%%:*})"
 }
 
 cft-list() {
   _cft_check_deps || return 1
   _cft_mitm_init
-  local sub route_port entry real_port web_port
+  local sub route_port entry real_port web_port inspect auth tags
   jq -r '.routes | keys[]' "$CFT_DIR/routes.json" | while IFS= read -r sub; do
     route_port=$(jq -r --arg s "$sub" '.routes[$s]' "$CFT_DIR/routes.json")
     entry=$(_cft_mitm_entry "$sub")
     if [ -n "$entry" ]; then
       real_port=$(echo "$entry" | jq -r '.port')
-      web_port=$(echo "$entry" | jq -r '.web_port')
-      echo "$sub -> localhost:$real_port  [inspecting @ http://localhost:$web_port]"
+      inspect=$(echo "$entry" | jq -r '.inspect')
+      auth=$(echo "$entry" | jq -r '.auth')
+      tags=""
+      if [ "$inspect" = "1" ]; then
+        web_port=$(echo "$entry" | jq -r '.web_port')
+        tags="$tags [inspecting @ http://localhost:$web_port]"
+      fi
+      [ -n "$auth" ] && tags="$tags [auth: ${auth%%:*}]"
+      echo "$sub -> localhost:$real_port $tags"
     else
       echo "$sub -> localhost:$route_port"
     fi

@@ -75,38 +75,52 @@ source ~/.zshrc
 ## Usage
 
 ```bash
-cft <port> [subdomain]            # expose localhost:<port>, default subdomain "dev"
-cft <port> [subdomain] --inspect  # same, but with a request inspector (see below)
-cft-list                          # show current routes
-cft-rm <subdomain>                # remove a route
-cft-stop                          # stop the background cloudflared daemon (+ inspectors)
-cft-help                          # show all commands
+cft <port> [subdomain]                       # expose localhost:<port>, default subdomain "dev"
+cft <port> [subdomain] --inspect             # same, with a request inspector (see below)
+cft <port> [subdomain] --auth user:pass      # same, behind HTTP Basic Auth
+cft <port> [subdomain] --inspect --auth u:p  # both at once
+cft-list                                     # show current routes (+ inspect/auth tags)
+cft-rm <subdomain>                           # remove a route
+cft-stop                                     # stop cloudflared daemon + any proxies
+cft-help                                     # show all commands
 ```
 
-### Request inspector (`--inspect`)
+### Request inspector (`--inspect`) and Basic Auth (`--auth`)
 
-`cft 3000 app --inspect` puts [mitmweb](https://mitmproxy.org/) (`brew install mitmproxy`)
-in between cloudflared and your app — a local reverse proxy that logs every request and
-response, body included, in a browser UI. This is the ngrok-inspector equivalent:
+Both are powered by [mitmproxy](https://mitmproxy.org/) (`brew install mitmproxy`), which
+sits between cloudflared and your app as a local reverse proxy (plain HTTP → HTTP, no
+certs needed — Cloudflare already terminated TLS at the edge):
 
 ```text
 cft 3000 app --inspect
 # https://app.<your-domain> -> localhost:3000
 # inspector: http://localhost:13500 (password: <random, printed each time it (re)starts>)
+
+cft 3000 app --auth alice:s3cret
+# https://app.<your-domain> -> localhost:3000
+# basic auth enabled (user: alice)
 ```
 
-Open the inspector URL, enter the printed password once (it's remembered via a cookie
-after that). Traffic flow: `Cloudflare edge → cloudflared → mitmweb → localhost:3000`, all
-plain HTTP locally (no certs needed — Cloudflare already terminated TLS at the edge).
+`--inspect` runs `mitmweb` and opens a browser UI with every request/response, body
+included — the ngrok-inspector equivalent. Open the printed URL, enter the password once
+(remembered via a cookie after that).
 
-- `mitmweb`'s listen port is `<port> + 10000`, its web UI is `<port> + 10500` — pick dev
-  ports below ~10000 to avoid collisions with other local services.
-- Re-running `cft 3000 app` (without `--inspect`) switches that route back to hitting
-  your app directly and stops the inspector for it.
-- `cft-list` shows `[inspecting @ http://localhost:...]` next to any route currently in
-  inspect mode; `cft-rm`/`cft-stop` clean up inspector processes too.
-- State lives in `mitm.json` (gitignored — holds per-inspector passwords) and
-  `mitm-<subdomain>.log` (mitmweb's own log, also gitignored).
+`--auth user:pass` runs the addon in `mitm_basic_auth.py`, which returns `401` with a
+`WWW-Authenticate` challenge for any request missing the exact `Authorization: Basic`
+header — enforced before the request ever reaches your app. Combine both flags to inspect
+*and* password-protect the same route in one proxy process.
+
+- The proxy's listen port is `<port> + 10000`; `--inspect`'s web UI (if used) is
+  `<port> + 10500` — pick dev ports below ~10000 to avoid collisions with other local
+  services.
+- Re-running `cft 3000 app` with different flags (or none) replaces the proxy for that
+  route accordingly — dropping `--inspect`/`--auth` switches back to hitting your app
+  directly and stops the old proxy process.
+- `cft-list` shows `[inspecting @ http://localhost:...]` and/or `[auth: <user>]` next to
+  any route currently proxied.
+- State lives in `mitm.json` (gitignored — holds inspector/auth passwords in plaintext,
+  local-only) and `mitm-<subdomain>.log` (the proxy's own log, also gitignored).
+  `mitm_basic_auth.py` itself is plain code, safe to commit.
 
 ## Files
 
