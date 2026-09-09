@@ -12,25 +12,51 @@ _cft_check_deps() {
 }
 
 # Fast local pre-check: ask Cloudflare directly whether <sub>.<domain>
-# already exists and points somewhere other than our own tunnel (e.g. the
-# selfhosted-server tunnel). This is best-effort only -- it can't see
-# pre-emptive reservations that don't have a DNS record yet, or run before
-# the first `terraform apply` (no outputs to read yet). The real hard stop
-# is main.tf's lifecycle.precondition, which always runs before any API call
-# that could touch a record.
-_cft_is_reserved() {
+# already exists, in one API call. Sets:
+#   _CFT_DNS_RESERVED=1   record exists and points elsewhere (e.g. the
+#                         selfhosted-server tunnel) -- caller must refuse.
+#   _CFT_DNS_RECORD_ID    non-empty if a record exists and already points at
+#                         OUR tunnel -- it can be imported instead of
+#                         recreated (see _cft_adopt_existing_dns).
+#   _CFT_DNS_ZONE_ID      zone_id, cached for the importer to reuse.
+# Best-effort only -- can't see pre-emptive reservations that don't have a
+# DNS record yet, or run before the first `terraform apply` (no outputs to
+# read yet). The real hard stop for reserved names is main.tf's
+# lifecycle.precondition, which always runs before any API call that could
+# touch a record.
+_cft_check_existing_dns() {
   local sub="$1"
-  local zone_id domain tunnel_id
-  zone_id=$(cd "$CFT_DIR" && terraform output -raw zone_id 2>/dev/null)
+  _CFT_DNS_RESERVED=0
+  _CFT_DNS_RECORD_ID=""
+  _CFT_DNS_ZONE_ID=$(cd "$CFT_DIR" && terraform output -raw zone_id 2>/dev/null)
+  local domain tunnel_id
   domain=$(cd "$CFT_DIR" && terraform output -raw domain 2>/dev/null)
   tunnel_id=$(cd "$CFT_DIR" && terraform output -raw tunnel_id 2>/dev/null)
-  [ -z "$zone_id" ] || [ -z "$domain" ] || [ -z "$tunnel_id" ] && return 1
+  [ -z "$_CFT_DNS_ZONE_ID" ] || [ -z "$domain" ] || [ -z "$tunnel_id" ] && return 0
 
-  local content
-  content=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-    "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${sub}.${domain}" \
-    | jq -r '.result[0].content // empty')
-  [ -n "$content" ] && [ "$content" != "${tunnel_id}.cfargotunnel.com" ]
+  local content id
+  IFS=$'\t' read -r content id < <(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+    "https://api.cloudflare.com/client/v4/zones/${_CFT_DNS_ZONE_ID}/dns_records?name=${sub}.${domain}" \
+    | jq -r '[(.result[0].content // ""), (.result[0].id // "")] | @tsv')
+
+  [ -z "$id" ] && return 0
+  if [ "$content" = "${tunnel_id}.cfargotunnel.com" ]; then
+    _CFT_DNS_RECORD_ID="$id"
+  else
+    _CFT_DNS_RESERVED=1
+  fi
+}
+
+# If _cft_check_existing_dns found a record already pointing at our tunnel,
+# adopt it into terraform state instead of letting `apply` try (and fail)
+# to create a duplicate. No-op if it's already tracked or none was found.
+_cft_adopt_existing_dns() {
+  local sub="$1"
+  [ -z "$_CFT_DNS_RECORD_ID" ] && return 0
+  local addr="cloudflare_dns_record.tunnel[\"$sub\"]"
+  (cd "$CFT_DIR" && terraform state list 2>/dev/null | grep -qF "$addr") && return 0
+  echo "found existing DNS record for '$sub' pointing at this tunnel -- adopting it" >&2
+  (cd "$CFT_DIR" && terraform import "$addr" "${_CFT_DNS_ZONE_ID}/${_CFT_DNS_RECORD_ID}" >/dev/null 2>&1)
 }
 
 _cft_apply() {
@@ -175,6 +201,35 @@ _cft_start_proxy() {
   _CFT_MITM_WEB_URL=$(_cft_web_url "$inspect" "$web_port" "$password")
 }
 
+# Detects the tunnel daemon dying unexpectedly (crash, or the machine got
+# rebooted) as opposed to a deliberate `cft-stop` (which removes the pidfile
+# itself) -- only in that unexpected case does it tear down the now-dead
+# routes' DNS records, so they don't linger pointing at a tunnel nobody is
+# running. A deliberately-stopped daemon leaves routes.json untouched, same
+# as before, so `cft-stop` then `cft <port> <sub>` still just resumes it.
+# Cheap (one local `kill -0`, no network) whenever the daemon is fine or was
+# never started -- the network-touching teardown only runs in the rare case
+# it's actually needed.
+_cft_reconcile_stale_daemon() {
+  local pidfile="$CFT_DIR/.cloudflared.pid"
+  [ -f "$pidfile" ] || return 0
+  kill -0 "$(cat "$pidfile")" 2>/dev/null && return 0
+
+  local n
+  n=$(jq -r '.routes | length' "$CFT_DIR/routes.json" 2>/dev/null)
+  if [ -z "$n" ] || [ "$n" = "0" ]; then
+    rm -f "$pidfile"
+    return 0
+  fi
+
+  echo "cft: tunnel daemon died unexpectedly (crash or reboot) -- tearing down $n stale route(s)" >&2
+  echo '{"routes": {}}' > "$CFT_DIR/routes.json"
+  _cft_apply >/dev/null 2>&1
+  echo '{}' > "$CFT_DIR/mitm.json" 2>/dev/null
+  rm -f "$pidfile"
+  echo "cft: done -- run 'cft <port> [subdomain]' to bring routes back up" >&2
+}
+
 _cft_ensure_daemon() {
   local pidfile="$CFT_DIR/.cloudflared.pid"
   if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
@@ -223,6 +278,7 @@ EOF
 
 cft() {
   _cft_check_deps || return 1
+  _cft_reconcile_stale_daemon
   local port="$1"
   if [ -z "$port" ]; then
     echo "usage: cft <port> [subdomain] [--inspect] [--auth user:pass]   -- (run 'cft-help' for details)" >&2
@@ -242,7 +298,8 @@ cft() {
     esac
   done
 
-  if _cft_is_reserved "$sub"; then
+  _cft_check_existing_dns "$sub"
+  if [ "$_CFT_DNS_RESERVED" -eq 1 ]; then
     echo "refusing: '$sub' is reserved for the other (selfhosted-server) tunnel on this zone" >&2
     return 1
   fi
@@ -253,6 +310,7 @@ cft() {
   _cft_json_update "$CFT_DIR/routes.json" '.routes[$sub] = $port' \
     --arg sub "$sub" --argjson port "$route_port"
 
+  _cft_adopt_existing_dns "$sub"
   _cft_apply || return 1
   _cft_ensure_daemon || return 1
 
@@ -315,4 +373,5 @@ cft-stop() {
   echo '{}' > "$CFT_DIR/mitm.json"
 }
 
+[ -n "$CFT_DIR" ] && _cft_reconcile_stale_daemon
 echo "cft tunnel helpers loaded (cft, cft-list, cft-rm, cft-stop) — run 'cft-help' for details"

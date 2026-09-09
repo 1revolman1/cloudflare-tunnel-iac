@@ -29,6 +29,17 @@ cft 3000 app
   auto-detected from the zone's live DNS records — nothing to maintain by hand. See
   `variables.tf`'s `reserved_subdomains` if you ever need to pre-reserve a name that
   doesn't have a DNS record yet.
+- **Adopt, don't fail**: if that same live check finds a record for `<sub>.<domain>` that
+  already points at *this* tunnel (created manually, or left over from before), `cft`
+  imports it into Terraform state instead of letting `apply` error out with "already
+  exists" — no need to `terraform import` by hand.
+- **Crash/reboot cleanup**: the cloudflared daemon is a single background process shared
+  by every route, tracked in `.cloudflared.pid`. If that process is gone but the pidfile
+  is still there — the machine got rebooted, or it crashed — `cft.sh` (checked on every
+  new shell, and at the top of `cft`) tears down all currently-configured DNS records
+  and clears `routes.json`/`mitm.json`, since nothing is actually serving them anymore.
+  A deliberate `cft-stop` removes the pidfile itself, so it's never mistaken for a crash —
+  routes.json is left alone and `cft <port> <sub>` just resumes where you left off.
 
 ## Prerequisites
 

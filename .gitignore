@@ -6,3 +6,4 @@ terraform.tfvars
 cloudflared.log
 mitm.json
 mitm-*.log
+.claude/
